@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stddef.h>
+#include <limits.h>
 
 enum tiles_e {
 	EMPTY,
@@ -127,6 +128,7 @@ struct game {
 	enum game_state_e state;
 	struct entity *actor;
 	char actor_x, actor_y;
+	char quit;
 };
 
 void draw(struct game *g);
@@ -145,7 +147,19 @@ enum directions_e opposite(enum directions_e d);
 struct playfield_chunk *generate_pc(void);
 void free_pc(struct playfield_chunk *c);
 char is_full(char x, char y, struct playfield_chunk *c);
+char is_cover(const struct entity *t);
 void place(struct playfield_chunk *c, struct entity *(*make_f)(void));
+
+char is_cover(const struct entity *t) {
+	switch(t->type) {
+		case O_COVER:
+		case I_COVER:
+		case H_COVER:
+			return 1;
+		default:
+			return 0;
+	}
+}
 
 enum directions_e opposite(enum directions_e d) {
 	switch(d) {
@@ -284,9 +298,20 @@ char is_full(char r, char c, struct playfield_chunk *pc) {
 	}
 }
 
+void _place(struct playfield_chunk *c, struct entity *(*make_f)(void), char x, char y);
+
+void _place(struct playfield_chunk *c, struct entity *(*make_f)(void), char x, char y) {
+	struct entity *e;
+
+	if(is_full(y, x, c))
+		return;
+	e = make_f();
+	hold(e);
+	c->field[x][y] = e;
+}
+
 void place(struct playfield_chunk *c, struct entity *(*make_f)(void)) {
 	char j, k;
-	struct entity *e;
 
 	j = rand() % CHUNK_SIZE_ROWS;
 	k = rand() % CHUNK_SIZE_COLS;
@@ -298,15 +323,157 @@ void place(struct playfield_chunk *c, struct entity *(*make_f)(void)) {
 		if(j == CHUNK_SIZE_ROWS)
 			j = 0;
 	}
-	e = make_f();
-	hold(e);
-	c->field[k][j] = e;
+	_place(c, make_f, k, j);
 }
 
 #define MAX_SOLDIERS 	2
 #define MAX_ALIENS	5
 #define MAX_COVER	((CHUNK_SIZE_ROWS * CHUNK_SIZE_COLS - MAX_SOLDIERS - MAX_ALIENS) / 10)
 
+#define MAKER(a) ((struct entity *(*)(void))(a))
+
+#define NEEDS_REFRESH(a) (!(a) || (a)->_e.ref_count == UCHAR_MAX)
+
+void _draw_line(signed char src_x, signed char src_y, signed char dst_x, signed char dst_y, struct playfield_chunk *c);
+void _draw_shadow_line(signed char src_x, signed char src_y, signed char dst_x, signed char dst_y, 
+		signed char o_dst_x, signed char o_dst_y, struct playfield_chunk *c);
+
+void _draw_line(signed char src_x, signed char src_y, signed char dst_x, signed char dst_y, struct playfield_chunk *c) {
+	struct grass *grass = NULL;
+	signed char dx, dy, sx, sy, err, e2;
+	signed char x0, y0;
+
+	dx = abs(dst_x - src_x);
+	sx = src_x < dst_x ? 1 : -1;
+	dy = abs(dst_y - src_y);
+	sy = src_y < dst_y ? 1 : -1; 
+	err = (dx > dy ? dx : -dy)/2;
+	x0 = src_x;
+	y0 = src_y;
+ 
+	for(;;) {
+		if(y0 >= 0 && y0 < CHUNK_SIZE_ROWS &&
+				x0 >= 0 && x0 < CHUNK_SIZE_COLS &&
+				!is_full(y0, x0, c)) {
+			if(NEEDS_REFRESH(grass))
+				grass = make_grass();
+			hold((struct entity *)grass);
+			c->field[x0][y0] = (struct entity *)grass;
+		}
+
+		if (x0 == dst_x && y0 == dst_y)
+			break;
+
+		e2 = err;
+    		if (e2 >-dx) {
+			err -= dy;
+			x0 += sx;
+		}
+		if (e2 < dy) {
+			err += dx;
+			y0 += sy;
+		}
+	}
+
+
+}
+
+#define INSIDE(x, y) ((x) >= 0 && (x) < CHUNK_SIZE_COLS && \
+		(y) >= 0 && (y) < CHUNK_SIZE_ROWS)
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define BETWEEN(x, x0, x1) ((x) < MAX((x0), (x1)) && (x) > MIN((x0), (x1)))
+
+void _draw_shadow_line(signed char src_x, signed char src_y, signed char dst_x, signed char dst_y, 
+		signed char o_dst_x, signed char o_dst_y, struct playfield_chunk *c) {
+	struct grass *grass = NULL;
+	signed char dx, dy, sx, sy, err, e2;
+	signed char x0, y0;
+
+	dx = abs(dst_x - src_x);
+	sx = src_x < dst_x ? 1 : -1;
+	dy = abs(dst_y - src_y);
+	sy = src_y < dst_y ? 1 : -1; 
+	err = (dx > dy ? dx : -dy)/2;
+	x0 = src_x;
+	y0 = src_y;
+ 
+	for(;;) {
+		if(INSIDE(x0, y0)) {
+			if(!BETWEEN(x0, src_x, o_dst_x) &&
+				!BETWEEN(y0, src_y, o_dst_y)
+				&& !is_full(y0, x0, c)) {
+				if(NEEDS_REFRESH(grass))
+					grass = make_grass();
+				hold((struct entity *)grass);
+				c->field[x0][y0] = (struct entity *)grass;
+			}
+		} else {
+			break;
+		}
+
+		e2 = err;
+    		if (e2 >-dx) {
+			err -= dy;
+			x0 += sx;
+		}
+		if (e2 < dy) {
+			err += dx;
+			y0 += sy;
+		}
+	}
+
+
+}
+
+struct playfield_chunk *generate_pc(void) {
+	char i, j;
+	struct ground *ground = NULL;
+	struct playfield_chunk *c;
+	signed char src_x, src_y, dst_x, dst_y;
+       
+	c = malloc(sizeof(*c));
+
+	for(i = 0; i < MAX_DIR; ++i) {
+		c->neighs[i] = NULL;
+	}
+	
+	for(i = 0; i < CHUNK_SIZE_ROWS; ++i) {
+		for(j = 0; j < CHUNK_SIZE_COLS; ++j) {
+			if(NEEDS_REFRESH(ground))
+				ground = make_ground();
+			hold((struct entity *)ground);
+			c->field[j][i] = (struct entity *)ground;
+		}
+	}
+
+	/* draw a line between 2 random coordinates */
+	do {
+		src_x = rand() % CHUNK_SIZE_COLS;
+		dst_x = rand() % CHUNK_SIZE_COLS;
+		src_y = rand() % CHUNK_SIZE_ROWS;
+		dst_y = rand() % CHUNK_SIZE_ROWS;
+	} while(src_x == dst_x && src_y == dst_y);
+
+	_place(c, MAKER(make_soldier), src_x, src_y);
+	_place(c, MAKER(make_alien), dst_x, dst_y);
+
+	/* FIXME: depending on relative positions, we don't want to 
+	 * look at all 4 possibilities. If the 2 positions are aligned then
+	 * we're looking at one only? And if they're not, at 3?
+	 * Can we make the light cone 'diverge' a bit if 2 objects
+	 * are aligned but pretty close?
+	 */
+
+	_draw_shadow_line(src_x, src_y, dst_x-1, dst_y, dst_x, dst_y, c);
+	_draw_shadow_line(src_x, src_y, dst_x+1, dst_y, dst_x, dst_y, c);
+	_draw_shadow_line(src_x, src_y, dst_x, dst_y-1, dst_x, dst_y, c);
+	_draw_shadow_line(src_x, src_y, dst_x, dst_y+1, dst_x, dst_y, c);
+
+	return c;
+}
+
+#if 0
 struct playfield_chunk *generate_pc(void) {
 	char i, j;
 	struct grass *grass = NULL;
@@ -359,6 +526,7 @@ struct playfield_chunk *generate_pc(void) {
 
 	return c;
 }
+#endif
 
 void free_pc(struct playfield_chunk *c) {
 	char i, j;
@@ -388,6 +556,7 @@ void init_game(struct game *g) {
 	g->turn = 0;
 	g->status = "ready";
 	g->state = IDLE;
+	g->quit = 0;
 }
 
 void destroy_game(struct game *g) {
@@ -440,13 +609,72 @@ void toggle_crs(struct game *g, char change_status) {
 	return;
 }
 
+char to_hit(struct game *g);
+void fire(struct game *g);
+
+#define MAX_DISTANCE_TO_HIT 	20
+#define MIN_DAMAGE		1
+#define MAX_DAMAGE		5
+
+struct entity *inside(char x, char y, signed char off_x, signed char off_y, struct game *g) {
+	if((off_x < 0 && !x) || (off_y < 0 && !y))
+		return NULL;
+	if(off_x > 0 && (x == CHUNK_SIZE_COLS || off_y && y == CHUNK_SIZE_ROWS))
+		return NULL;
+	if(!off_x && x > CHUNK_SIZE_COLS)
+		return NULL;
+	if(!off_y && y > CHUNK_SIZE_ROWS)
+		return NULL;
+	return g->pc->field[x+off_x][y+off_y];
+}
+
+char to_hit(struct game *g) {
+	struct entity *t = NULL;
+	struct cover *c = NULL;
+	char cover = 0;
+	signed char off_x = g->crs.x - g->actor_x;
+	signed char off_y = g->crs.y - g->actor_y;
+	char distance = abs(off_x) + abs(off_y);
+
+	if(distance > MAX_DISTANCE_TO_HIT)
+		return 1;
+
+	if(off_x && (t = inside(g->crs.x, g->crs.y, off_x, 0, g)) && is_cover(t)) {
+		c = (struct cover *)t;
+		cover += 1 + c->high;
+	}
+
+	if(off_y && (t = inside(g->crs.x, g->crs.y, 0, off_y, g)) && is_cover(t)) {
+		c = (struct cover *)t;
+		cover += 1 + c->high;
+	}
+
+	// TODO: apply cover
+
+	return 255 / ((distance + 1) * (cover + 1)) * MAX_DISTANCE_TO_HIT;
+}
+	
+
+void fire(struct game *g) {
+	char roll = rand();
+	char tohit = to_hit(g);
+	char hit = roll > tohit;
+	char crit = hit && roll - tohit > roll;
+	if(hit) {
+		if(crit)
+			g->status = "crit";
+		else
+			g->status = "hit";
+	} else
+		g->status = "missed";
+}
+
 void select_target(struct game *g) {
        if(g->state == IDLE) {
 		g->actor = g->pc->field[g->crs.x][g->crs.y];
 		g->actor_x = g->crs.x;
 		g->actor_y = g->crs.y;
 		switch(g->actor->type) {
-			case ALIEN:
 			case SOLDIER:
 				break;
 			default:
@@ -456,9 +684,19 @@ void select_target(struct game *g) {
 		g->state = FIRING;
 		g->status = "select target";
 	} else if(g->state == FIRING) {
-		g->status = "FIRE!";
+		struct entity *t = g->pc->field[g->crs.x][g->crs.y];
+		switch(t->type) {
+			case ALIEN:
+				break;
+			default:
+				g->status = "cannot target";
+				return;
+		}
+		fire(g);
 		g->state = IDLE;
 		toggle_crs(g, 0);
+		g->crs.x = g->actor_x;
+		g->crs.y = g->actor_y;
 	}
 }
 
@@ -484,6 +722,9 @@ void act(struct game *g, char in) {
 		case 'f':
 			select_target(g);
 			break;
+		case 'Q':
+			g->quit = 1;
+			break;
 		default:
 			g->status = "unknown command";
 	}
@@ -491,27 +732,29 @@ void act(struct game *g, char in) {
 				
 
 int main(void) {
-	struct game g;
-	char in;
-	init_game(&g);
+	while(1) {
+		struct game g;
+		char in;
+		init_game(&g);
 
-	cursor(0);
-	clrscr();
-	draw_board(&g);
+		cursor(0);
+		clrscr();
+		draw_board(&g);
 
-	do {
-		draw(&g);
+		do {
+			draw(&g);
 
-	        while(!kbhit())
-	                ;
-	        while(kbhit()) {
-	                in = cgetc();
-		}
+		        while(!kbhit())
+		                ;
+		        while(kbhit()) {
+		                in = cgetc();
+			}
 
-		act(&g, in);
-	} while(1);
+			act(&g, in);
+		} while(!g.quit);
 
-	destroy_game(&g);
+		destroy_game(&g);
+	}
 	return EXIT_SUCCESS;
 }
 
